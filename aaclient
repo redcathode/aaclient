@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+
+
+import sys, argparse, tempfile, time, os
+from lxml import html, etree
+import requests as re
+from tqdm import tqdm
+import libtorrent as lt
+
+
+book_xpaths = {"collection": "/html/body/main/div[3]/ul/li[last()]/div/a[1]",
+               "torrent": "/html/body/main/div[3]/ul/li[last()]/div/a[2]/text()",
+               "torrent_url": "/html/body/main/div[3]/ul/li[last()]/div/a[2]/@href",
+               "filename_within_torrent": "/html/body/main/div[3]/ul/li[last()]/div/text()[3]",
+               "title": "/html/body/main/div[1]/div[3]/text()",
+               "extension": "/html/body/main/div[1]/div[2]/text()"}
+
+replace_chars = str.maketrans(dict.fromkeys(''.join([" /"]), '.') | dict.fromkeys(''.join([":;"]), None))
+
+state_str = ['queued', 'checking', 'downloading metadata', \
+    'downloading', 'finished', 'seeding', 'allocating', 'checking fastresume']
+
+def file_search(torrent_info, desired_file):
+    priorities = []
+    fidx = -1
+    size = -1
+    path = ""
+    for idx, des in enumerate(torrent_info.files()):
+        if des.path.endswith(desired_file):
+            priorities.append(255)
+            fidx = idx
+            size = des.size
+            path = des.path # todo: tidy this up a bit
+        else:
+            priorities.append(0)
+    if idx == -1:
+        raise Exception("Destination file not found in torrent")
+    return (fidx, size, path, priorities)
+
+
+def check_torrent_completion(ses, idx):
+
+    alerts = ses.pop_alerts()
+
+    for a in alerts:
+        alert_type = type(a).__name__
+        if alert_type == "file_completed_alert":
+            if a.index == idx:
+                return True
+
+    return False
+
+
+def download_torrent(t_path, desired_file, save_filename, save_path="."):
+    info = lt.torrent_info(t_path)
+    ses = lt.session({'listen_interfaces': '0.0.0.0:6881'})
+
+    idx, size, path, priorities = file_search(info, desired_file)
+    # print(path)
+    h = ses.add_torrent({'ti': info, 'save_path': save_path})
+    h.prioritize_files(priorities)
+
+    alert_mask = (lt.alert.category_t.error_notification |
+                        lt.alert.category_t.performance_warning |
+                        lt.alert.category_t.progress_notification)
+    ses.set_alert_mask(alert_mask)
+    old = 0 # hacky workaround for missing tqdm feature
+    with tqdm(unit='B', unit_scale=True, unit_divisor=1024, miniters=1, total=size) as pbar:
+        while True:
+            s = h.status()
+            prog = h.file_progress()[idx]
+            add = prog - old
+            old = prog
+            pbar.update(add) # todo: this is expensive
+            pbar.set_description(f"{state_str[s.state]} ({s.num_peers} {"peer" if s.num_peers == 1 else "peers"})", refresh=True)
+
+            if check_torrent_completion(ses, idx):
+                os.rename(save_path + "/" + path, save_path + "/" + save_filename)
+                pbar.update(size)
+                pbar.set_description_str("finished", refresh=True)
+                # pbar.refresh()
+                return
+
+            time.sleep(.1)
+
+
+
+
+def get_torrent_from_listing(url, use_hash_as_filename, guess_extension):
+
+    page = re.get(url)
+    tree = html.fromstring(page.content)
+
+    fname = tree.xpath(book_xpaths["filename_within_torrent"])[0].split('“', 1)[1][:-1]
+    t_url = tree.xpath(book_xpaths["torrent_url"])[0]
+    torrent = tree.xpath(book_xpaths["torrent"])[0][:-1][1:]
+
+
+    extension = tree.xpath(book_xpaths["extension"])[0].split(', ')[1]
+    title = tree.xpath(book_xpaths["title"])[0].translate(replace_chars)
+
+    save_as = fname if use_hash_as_filename else title
+    # print(save_as)
+    if guess_extension:
+        save_as += extension
+    aa = url.split("/")
+    return (f"{aa[0]}//{aa[2]}{str(t_url)}", torrent, fname, save_as)
+
+
+def dl_torrent_from_listing(url, save_path=".", use_hash_as_filename=False, guess_extension=True):
+    t_url, torrent, fname, save_as = get_torrent_from_listing(url, use_hash_as_filename, guess_extension)
+    t = re.get(t_url, allow_redirects=True, stream=True)
+    path = f"{save_path}/{torrent}"
+
+    with open(path, "wb") as fout:
+        with tqdm(
+            # all optional kwargs
+            unit='B', unit_scale=True, unit_divisor=1024, miniters=1,
+            desc=f"downloading {torrent}", total=int(t.headers.get('content-length', 0))
+        ) as pbar:
+            for chunk in t.iter_content(chunk_size=4096):
+                fout.write(chunk)
+                pbar.update(len(chunk))
+            pbar.update(int(t.headers.get('content-length', 0)))
+            pbar.set_description_str(f"downloaded {torrent}", refresh=True)
+
+    return (path, fname, save_as)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='aaclient - anna\'s archive downloader')
+
+    parser.add_argument('url', type=str, help='URL to download')
+    parser.add_argument('-s', '--save_path', type=str, default='.', help='Save path (default: current directory)')
+    parser.add_argument('-t', '--use_listing_title_as_filename', action='store_true', default=True, help='Use listing title as filename (default: True)')
+    parser.add_argument('-g', '--guess_extension_from_listing', action='store_true', default=True, help='Guess extension from listing (default: True)')
+    parser.add_argument('--temp_file_path', type=str, default=tempfile.gettempdir(), help=f'Temp directory (defaults to folder in {tempfile.gettempdir()})')
+
+    return parser.parse_args()
+
+if __name__ == '__main__':
+    args = parse_args()
+    # print(args)
+    path, fname, save_as = dl_torrent_from_listing(args.url, use_hash_as_filename=(not args.use_listing_title_as_filename), guess_extension=args.guess_extension_from_listing)
+
+    download_torrent(path, fname, save_as, save_path=args.save_path)
