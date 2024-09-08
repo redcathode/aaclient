@@ -1,5 +1,6 @@
 # aaclient
 aaclient is a command-line tool to download anna's archive listings (currently, only via the torrent).  
+note that you'll need to install tqdm, lxml, and libtorrent on your system, or have them in a venv. i will eventually make proper packages for this thing
 
 ## basic usage
 ```shell
