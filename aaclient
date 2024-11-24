@@ -72,7 +72,7 @@ def download_torrent(t_path, desired_file, save_filename, save_path="."):
             add = prog - old
             old = prog
             pbar.update(add) # todo: this is expensive
-            pbar.set_description(f"{state_str[s.state]} ({s.num_peers} {"peer" if s.num_peers == 1 else "peers"})", refresh=True)
+            pbar.set_description(f"{state_str[s.state]} ({s.num_peers} {'peer' if s.num_peers == 1 else 'peers'})", refresh=True)
 
             if check_torrent_completion(ses, idx):
                 os.rename(save_path + "/" + path, save_path + "/" + save_filename)
